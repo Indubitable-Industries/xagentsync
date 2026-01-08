@@ -1,0 +1,15 @@
+# Build
+/target
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# XAgentSync local state
+.xas/wip.json
+.xas/agent.json
