@@ -5,6 +5,10 @@ edition = "2024"
 description = "LLM-to-LLM async communication middleware for non-real-time collaboration"
 authors = ["phaze"]
 license = "MIT"
+repository = "https://github.com/Indubitable-Industries/xagentsync"
+readme = "README.md"
+keywords = ["llm", "ai", "agents", "handoff", "async"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 # CLI

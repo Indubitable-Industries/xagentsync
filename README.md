@@ -45,14 +45,13 @@ XAgentSync creates **compiled handoffs** — structured packages that bootstrap 
 ## Installation
 
 ```bash
-# Clone and install
+# From crates.io (coming soon)
+# cargo install xagentsync
+
+# From source
 git clone https://github.com/Indubitable-Industries/xagentsync.git
 cd xagentsync
 cargo install --path .
-
-# Or build from source
-cargo build --release
-./target/release/xas --help
 ```
 
 **Requirements:** Rust 1.75+ (uses 2024 edition)
