@@ -3,26 +3,44 @@
 //! CLI tool for creating structured handoffs between LLM agents
 //! working asynchronously on shared codebases.
 
-use xagentsync::{
-    cli::{Cli, Commands, DeployAction, DebugAction, HandoffModeArg, PlanAction},
-    handoff::{
-        deploy::{Confidence, ShipItem},
-        debug::{AttemptOutcome, EvidenceKind, Likelihood},
-        plan::Priority,
-    },
-    GitRef, Handoff, HandoffMode, PriorityFile, Result, WarmUpSequence,
-    sync::{SyncConfig, SyncManager},
-};
-use std::path::PathBuf;
+use serde::Serialize;
+use std::path::{Path, PathBuf};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
+use xagentsync::{
+    GitRef, Handoff, HandoffMode, PriorityFile, Result, WarmUpSequence,
+    cli::{Cli, Commands, DebugAction, DeployAction, HandoffModeArg, PlanAction},
+    handoff::{
+        debug::{AttemptOutcome, EvidenceKind, Likelihood},
+        deploy::{Confidence, ShipItem},
+        plan::Priority,
+    },
+    sync::{SyncConfig, SyncManager},
+};
+
+#[derive(Debug, Serialize)]
+struct HandoffEvent {
+    event: &'static str,
+    id: String,
+    id_short: String,
+    mode: String,
+    summary: String,
+    path: String,
+    auto_commit: bool,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse_args();
+    let auto_commit = !cli.no_auto_commit;
+    let json_output = cli.json;
 
     // Set up logging
-    let level = if cli.verbose { Level::DEBUG } else { Level::INFO };
+    let level = if cli.verbose {
+        Level::DEBUG
+    } else {
+        Level::INFO
+    };
     let subscriber = FmtSubscriber::builder().with_max_level(level).finish();
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set subscriber");
 
@@ -52,19 +70,74 @@ async fn main() -> Result<()> {
                 branch,
                 pr,
                 tags,
+                auto_commit,
+                json_output,
             )
             .await
         }
-        Commands::Receive { prompt, mode, full, archive } => {
-            cmd_receive(&cli.sync_dir, prompt, mode, full, archive).await
-        }
+        Commands::Receive {
+            prompt,
+            mode,
+            full,
+            archive,
+        } => cmd_receive(&cli.sync_dir, prompt, mode, full, archive, auto_commit).await,
+        Commands::Archive { id } => cmd_archive(&cli.sync_dir, id, auto_commit, json_output).await,
         Commands::Whoami { set } => cmd_whoami(&cli.sync_dir, set).await,
         Commands::Status => cmd_status(&cli.sync_dir).await,
-        Commands::Deploy { action } => cmd_deploy(&cli.sync_dir, action).await,
-        Commands::Debug { action } => cmd_debug(&cli.sync_dir, action).await,
-        Commands::Plan { action } => cmd_plan(&cli.sync_dir, action).await,
+        Commands::Deploy { action } => {
+            cmd_deploy(&cli.sync_dir, action, auto_commit, json_output).await
+        }
+        Commands::Debug { action } => {
+            cmd_debug(&cli.sync_dir, action, auto_commit, json_output).await
+        }
+        Commands::Plan { action } => {
+            cmd_plan(&cli.sync_dir, action, auto_commit, json_output).await
+        }
         Commands::Sync { pull_only } => cmd_sync(&cli.sync_dir, pull_only).await,
     }
+}
+
+fn manager_for(sync_dir: &PathBuf, auto_commit: bool) -> Result<SyncManager> {
+    let mut config = SyncConfig::with_sync_dir(sync_dir);
+    config.auto_commit = auto_commit;
+    SyncManager::new(config)
+}
+
+fn emit_handoff_event(
+    event: &'static str,
+    handoff: &Handoff,
+    path: &Path,
+    json_output: bool,
+    auto_commit: bool,
+) -> Result<()> {
+    if json_output {
+        let id = handoff.id.to_string();
+        let payload = HandoffEvent {
+            event,
+            id_short: id[..8].to_string(),
+            id,
+            mode: handoff.mode.kind().to_string(),
+            summary: handoff.summary.clone(),
+            path: path.display().to_string(),
+            auto_commit,
+        };
+        println!("{}", serde_json::to_string(&payload)?);
+        return Ok(());
+    }
+
+    println!("Handoff created: {}", handoff.id);
+    println!("  Mode: {}", handoff.mode);
+    println!("  Summary: {}", handoff.summary);
+    println!("  Written to: {}", path.display());
+    println!(
+        "  Auto-commit: {}",
+        if auto_commit { "enabled" } else { "disabled" }
+    );
+    if event == "handoff_archived" {
+        println!("  State: archived");
+    }
+
+    Ok(())
 }
 
 async fn cmd_init(path: PathBuf) -> Result<()> {
@@ -93,9 +166,10 @@ async fn cmd_handoff(
     branch: Option<String>,
     pr: Option<String>,
     tags: Option<String>,
+    auto_commit: bool,
+    json_output: bool,
 ) -> Result<()> {
-    let config = SyncConfig::with_sync_dir(sync_dir);
-    let manager = SyncManager::new(config)?;
+    let manager = manager_for(sync_dir, auto_commit)?;
 
     let creator = get_current_agent(sync_dir)?;
 
@@ -142,11 +216,7 @@ async fn cmd_handoff(
 
     // Send it
     let path = manager.send_handoff(&handoff)?;
-
-    println!("Handoff created: {}", handoff.id);
-    println!("  Mode: {}", handoff.mode);
-    println!("  Summary: {}", handoff.summary);
-    println!("  Written to: {:?}", path);
+    emit_handoff_event("handoff_created", &handoff, &path, json_output, auto_commit)?;
 
     Ok(())
 }
@@ -157,9 +227,9 @@ async fn cmd_receive(
     mode_filter: Option<HandoffModeArg>,
     full: bool,
     archive: bool,
+    auto_commit: bool,
 ) -> Result<()> {
-    let config = SyncConfig::with_sync_dir(sync_dir);
-    let manager = SyncManager::new(config)?;
+    let manager = manager_for(sync_dir, auto_commit)?;
 
     let handoffs = manager.receive_handoffs()?;
 
@@ -214,7 +284,7 @@ async fn cmd_receive(
         }
 
         if archive {
-            manager.archive_handoff(&handoff.id.to_string()[..8])?;
+            manager.archive_handoff(&handoff.id.to_string())?;
             println!("  (archived)");
         }
     }
@@ -226,12 +296,36 @@ async fn cmd_receive(
     Ok(())
 }
 
+async fn cmd_archive(
+    sync_dir: &PathBuf,
+    handoff_id: String,
+    auto_commit: bool,
+    json_output: bool,
+) -> Result<()> {
+    let manager = manager_for(sync_dir, auto_commit)?;
+
+    // Single pass: archive_handoff does the directory scan and prefix match internally.
+    // Only deserialize the handoff if we need JSON output (which the bridge always requests).
+    let archive_path = manager.archive_handoff(&handoff_id)?;
+
+    if json_output {
+        let content = std::fs::read_to_string(&archive_path)?;
+        let handoff = Handoff::from_json(&content)?;
+        emit_handoff_event("handoff_archived", &handoff, &archive_path, true, auto_commit)?;
+    } else {
+        println!("Archived handoff {} to {}", handoff_id, archive_path.display());
+    }
+
+    Ok(())
+}
+
 async fn cmd_whoami(sync_dir: &PathBuf, set: Option<String>) -> Result<()> {
     let config = SyncConfig::with_sync_dir(sync_dir);
     let manager = SyncManager::new(config)?;
 
     if let Some(id) = set {
         manager.write_state("current_agent", &id)?;
+        manager.write_state("agent", &id)?;
         println!("Set identity to: {}", id);
     } else {
         match get_current_agent(sync_dir) {
@@ -286,9 +380,13 @@ async fn cmd_status(sync_dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_deploy(sync_dir: &PathBuf, action: DeployAction) -> Result<()> {
-    let config = SyncConfig::with_sync_dir(sync_dir);
-    let manager = SyncManager::new(config)?;
+async fn cmd_deploy(
+    sync_dir: &PathBuf,
+    action: DeployAction,
+    auto_commit: bool,
+    json_output: bool,
+) -> Result<()> {
+    let manager = manager_for(sync_dir, auto_commit)?;
 
     match action {
         DeployAction::New { summary } => {
@@ -301,7 +399,9 @@ async fn cmd_deploy(sync_dir: &PathBuf, action: DeployAction) -> Result<()> {
         }
 
         DeployAction::Ship { item, description } => {
-            let mut handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+            let mut handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             if let Some(ctx) = handoff.mode.as_deploy_mut() {
                 ctx.what_to_ship.push(ShipItem {
                     item: item.clone(),
@@ -314,7 +414,9 @@ async fn cmd_deploy(sync_dir: &PathBuf, action: DeployAction) -> Result<()> {
         }
 
         DeployAction::Verify { step } => {
-            let mut handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+            let mut handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             if let Some(ctx) = handoff.mode.as_deploy_mut() {
                 ctx.verification_steps.push(step.clone());
             }
@@ -323,7 +425,9 @@ async fn cmd_deploy(sync_dir: &PathBuf, action: DeployAction) -> Result<()> {
         }
 
         DeployAction::Rollback { plan } => {
-            let mut handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+            let mut handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             if let Some(ctx) = handoff.mode.as_deploy_mut() {
                 ctx.rollback_plan = Some(plan.clone());
             }
@@ -332,45 +436,57 @@ async fn cmd_deploy(sync_dir: &PathBuf, action: DeployAction) -> Result<()> {
         }
 
         DeployAction::EnvConcern { env, concern } => {
-            let mut handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+            let mut handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             if let Some(ctx) = handoff.mode.as_deploy_mut() {
-                ctx.env_concerns.push(xagentsync::handoff::deploy::EnvConcern {
-                    environment: env.clone(),
-                    concern: concern.clone(),
-                    mitigation: None,
-                });
+                ctx.env_concerns
+                    .push(xagentsync::handoff::deploy::EnvConcern {
+                        environment: env.clone(),
+                        concern: concern.clone(),
+                        mitigation: None,
+                    });
             }
             manager.save_wip(&handoff)?;
             println!("Added {} concern: {}", env, concern);
         }
 
         DeployAction::Breaking { what, affects } => {
-            let mut handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+            let mut handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             if let Some(ctx) = handoff.mode.as_deploy_mut() {
-                ctx.breaking_changes.push(xagentsync::handoff::deploy::BreakingChange {
-                    what: what.clone(),
-                    affects: affects.clone(),
-                    migration: None,
-                });
+                ctx.breaking_changes
+                    .push(xagentsync::handoff::deploy::BreakingChange {
+                        what: what.clone(),
+                        affects: affects.clone(),
+                        migration: None,
+                    });
             }
             manager.save_wip(&handoff)?;
             println!("Added breaking change: {} affects {}", what, affects);
         }
 
         DeployAction::Done => {
-            let handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+            let handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             let path = manager.send_handoff(&handoff)?;
             manager.clear_wip()?;
-            println!("Deploy handoff finalized: {:?}", path);
+            emit_handoff_event("handoff_created", &handoff, &path, json_output, auto_commit)?;
         }
     }
 
     Ok(())
 }
 
-async fn cmd_debug(sync_dir: &PathBuf, action: DebugAction) -> Result<()> {
-    let config = SyncConfig::with_sync_dir(sync_dir);
-    let manager = SyncManager::new(config)?;
+async fn cmd_debug(
+    sync_dir: &PathBuf,
+    action: DebugAction,
+    auto_commit: bool,
+    json_output: bool,
+) -> Result<()> {
+    let manager = manager_for(sync_dir, auto_commit)?;
 
     match action {
         DebugAction::New { problem } => {
@@ -382,7 +498,9 @@ async fn cmd_debug(sync_dir: &PathBuf, action: DebugAction) -> Result<()> {
         }
 
         DebugAction::Symptom { symptom } => {
-            let mut handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+            let mut handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             if let Some(ctx) = handoff.mode.as_debug_mut() {
                 ctx.symptoms.push(symptom.clone());
             }
@@ -391,7 +509,9 @@ async fn cmd_debug(sync_dir: &PathBuf, action: DebugAction) -> Result<()> {
         }
 
         DebugAction::Hypothesis { theory, likelihood } => {
-            let mut handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+            let mut handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             let lh = match likelihood.to_lowercase().as_str() {
                 "high" => Likelihood::High,
                 "low" => Likelihood::Low,
@@ -409,8 +529,14 @@ async fn cmd_debug(sync_dir: &PathBuf, action: DebugAction) -> Result<()> {
             println!("Added hypothesis: {}", theory);
         }
 
-        DebugAction::Tried { what, result, outcome } => {
-            let mut handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+        DebugAction::Tried {
+            what,
+            result,
+            outcome,
+        } => {
+            let mut handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             let oc = match outcome.to_lowercase().as_str() {
                 "fixed" => AttemptOutcome::Fixed,
                 "helped" => AttemptOutcome::Helped,
@@ -429,7 +555,9 @@ async fn cmd_debug(sync_dir: &PathBuf, action: DebugAction) -> Result<()> {
         }
 
         DebugAction::Evidence { content, kind } => {
-            let mut handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+            let mut handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             let k = match kind.to_lowercase().as_str() {
                 "log" => EvidenceKind::LogEntry,
                 "error" => EvidenceKind::ErrorMessage,
@@ -449,21 +577,26 @@ async fn cmd_debug(sync_dir: &PathBuf, action: DebugAction) -> Result<()> {
         }
 
         DebugAction::Suspect { path, reason } => {
-            let mut handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+            let mut handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             if let Some(ctx) = handoff.mode.as_debug_mut() {
-                ctx.suspected_files.push(xagentsync::handoff::debug::SuspectedFile {
-                    path: path.clone(),
-                    reason: reason.clone(),
-                    lines: None,
-                    confidence: Likelihood::Medium,
-                });
+                ctx.suspected_files
+                    .push(xagentsync::handoff::debug::SuspectedFile {
+                        path: path.clone(),
+                        reason: reason.clone(),
+                        lines: None,
+                        confidence: Likelihood::Medium,
+                    });
             }
             manager.save_wip(&handoff)?;
             println!("Added suspect file: {}", path);
         }
 
         DebugAction::Repro { steps } => {
-            let mut handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+            let mut handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             if let Some(ctx) = handoff.mode.as_debug_mut() {
                 ctx.reproduction_steps = Some(steps.clone());
             }
@@ -472,7 +605,9 @@ async fn cmd_debug(sync_dir: &PathBuf, action: DebugAction) -> Result<()> {
         }
 
         DebugAction::TryNext { next } => {
-            let mut handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+            let mut handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             if let Some(ctx) = handoff.mode.as_debug_mut() {
                 ctx.next_to_try = Some(next.clone());
             }
@@ -481,19 +616,25 @@ async fn cmd_debug(sync_dir: &PathBuf, action: DebugAction) -> Result<()> {
         }
 
         DebugAction::Done => {
-            let handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+            let handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             let path = manager.send_handoff(&handoff)?;
             manager.clear_wip()?;
-            println!("Debug handoff finalized: {:?}", path);
+            emit_handoff_event("handoff_created", &handoff, &path, json_output, auto_commit)?;
         }
     }
 
     Ok(())
 }
 
-async fn cmd_plan(sync_dir: &PathBuf, action: PlanAction) -> Result<()> {
-    let config = SyncConfig::with_sync_dir(sync_dir);
-    let manager = SyncManager::new(config)?;
+async fn cmd_plan(
+    sync_dir: &PathBuf,
+    action: PlanAction,
+    auto_commit: bool,
+    json_output: bool,
+) -> Result<()> {
+    let manager = manager_for(sync_dir, auto_commit)?;
 
     match action {
         PlanAction::New { goal } => {
@@ -504,8 +645,13 @@ async fn cmd_plan(sync_dir: &PathBuf, action: PlanAction) -> Result<()> {
             println!("Use 'xas plan require', 'xas plan decided', etc. to add details.");
         }
 
-        PlanAction::Require { requirement, priority } => {
-            let mut handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+        PlanAction::Require {
+            requirement,
+            priority,
+        } => {
+            let mut handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             let p = match priority.to_lowercase().as_str() {
                 "must" => Priority::Must,
                 "could" => Priority::Could,
@@ -513,19 +659,22 @@ async fn cmd_plan(sync_dir: &PathBuf, action: PlanAction) -> Result<()> {
                 _ => Priority::Should,
             };
             if let Some(ctx) = handoff.mode.as_plan_mut() {
-                ctx.requirements.push(xagentsync::handoff::plan::Requirement {
-                    description: requirement.clone(),
-                    priority: p,
-                    source: None,
-                    confirmed: false,
-                });
+                ctx.requirements
+                    .push(xagentsync::handoff::plan::Requirement {
+                        description: requirement.clone(),
+                        priority: p,
+                        source: None,
+                        confirmed: false,
+                    });
             }
             manager.save_wip(&handoff)?;
             println!("Added requirement: {}", requirement);
         }
 
         PlanAction::Decided { decision, why } => {
-            let mut handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+            let mut handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             if let Some(ctx) = handoff.mode.as_plan_mut() {
                 ctx.decisions.push(xagentsync::handoff::plan::Decision {
                     decision: decision.clone(),
@@ -539,27 +688,37 @@ async fn cmd_plan(sync_dir: &PathBuf, action: PlanAction) -> Result<()> {
         }
 
         PlanAction::Rejected { option, reason } => {
-            let mut handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+            let mut handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             if let Some(ctx) = handoff.mode.as_plan_mut() {
-                ctx.rejected_options.push(xagentsync::handoff::plan::RejectedOption {
-                    option: option.clone(),
-                    reason: reason.clone(),
-                    reconsiderable: true,
-                });
+                ctx.rejected_options
+                    .push(xagentsync::handoff::plan::RejectedOption {
+                        option: option.clone(),
+                        reason: reason.clone(),
+                        reconsiderable: true,
+                    });
             }
             manager.save_wip(&handoff)?;
             println!("Recorded rejected option: {}", option);
         }
 
-        PlanAction::Question { question, importance, blocking } => {
-            let mut handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+        PlanAction::Question {
+            question,
+            importance,
+            blocking,
+        } => {
+            let mut handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             if let Some(ctx) = handoff.mode.as_plan_mut() {
-                ctx.open_questions.push(xagentsync::handoff::plan::OpenQuestion {
-                    question: question.clone(),
-                    importance: importance.clone(),
-                    ask_who: None,
-                    blocking,
-                });
+                ctx.open_questions
+                    .push(xagentsync::handoff::plan::OpenQuestion {
+                        question: question.clone(),
+                        importance: importance.clone(),
+                        ask_who: None,
+                        blocking,
+                    });
             }
             manager.save_wip(&handoff)?;
             let bl = if blocking { " (blocking)" } else { "" };
@@ -567,7 +726,9 @@ async fn cmd_plan(sync_dir: &PathBuf, action: PlanAction) -> Result<()> {
         }
 
         PlanAction::Constraint { constraint } => {
-            let mut handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+            let mut handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             if let Some(ctx) = handoff.mode.as_plan_mut() {
                 ctx.constraints.push(xagentsync::handoff::plan::Constraint {
                     constraint: constraint.clone(),
@@ -580,7 +741,9 @@ async fn cmd_plan(sync_dir: &PathBuf, action: PlanAction) -> Result<()> {
         }
 
         PlanAction::NextStep { step } => {
-            let mut handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+            let mut handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             if let Some(ctx) = handoff.mode.as_plan_mut() {
                 ctx.next_steps.push(step.clone());
             }
@@ -589,10 +752,12 @@ async fn cmd_plan(sync_dir: &PathBuf, action: PlanAction) -> Result<()> {
         }
 
         PlanAction::Done => {
-            let handoff = manager.load_wip()?.ok_or(xagentsync::Error::NoActiveHandoff)?;
+            let handoff = manager
+                .load_wip()?
+                .ok_or(xagentsync::Error::NoActiveHandoff)?;
             let path = manager.send_handoff(&handoff)?;
             manager.clear_wip()?;
-            println!("Plan handoff finalized: {:?}", path);
+            emit_handoff_event("handoff_created", &handoff, &path, json_output, auto_commit)?;
         }
     }
 
@@ -620,11 +785,14 @@ fn get_current_agent(sync_dir: &PathBuf) -> Result<String> {
     let config = SyncConfig::with_sync_dir(sync_dir);
     let manager = SyncManager::new(config)?;
 
-    manager
-        .read_state::<String>("current_agent")?
-        .ok_or_else(|| {
-            xagentsync::Error::AgentNotRegistered(
-                "No identity set. Use 'xas whoami --set <name>'".to_string(),
-            )
-        })
+    if let Some(agent) = manager.read_state::<String>("current_agent")? {
+        return Ok(agent);
+    }
+    if let Some(agent) = manager.read_state::<String>("agent")? {
+        return Ok(agent);
+    }
+
+    Err(xagentsync::Error::AgentNotRegistered(
+        "No identity set. Use 'xas whoami --set <name>'".to_string(),
+    ))
 }

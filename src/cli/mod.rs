@@ -12,6 +12,14 @@ pub struct Cli {
     #[arg(short, long, default_value = ".")]
     pub sync_dir: PathBuf,
 
+    /// Disable automatic git commits when creating or archiving handoffs
+    #[arg(long, global = true)]
+    pub no_auto_commit: bool,
+
+    /// Emit machine-readable JSON for handoff creation/finalization output
+    #[arg(long, global = true)]
+    pub json: bool,
+
     /// Verbose output
     #[arg(short, long)]
     pub verbose: bool,
@@ -89,6 +97,12 @@ pub enum Commands {
         /// Archive handoff after viewing
         #[arg(long)]
         archive: bool,
+    },
+
+    /// Archive a specific pending handoff by ID/prefix
+    Archive {
+        /// Handoff ID (full UUID or 8-char prefix)
+        id: String,
     },
 
     /// Set your agent identity

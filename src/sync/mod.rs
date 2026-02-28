@@ -83,7 +83,7 @@ impl SyncManager {
         // Create .gitignore for state directory (local only)
         let gitignore = self.config.state.join(".gitignore");
         if !gitignore.exists() {
-            std::fs::write(&gitignore, "wip.json\ncurrent_agent.json\n")?;
+            std::fs::write(&gitignore, "wip.json\ncurrent_agent.json\nagent.json\n")?;
         }
 
         info!(
@@ -108,7 +108,7 @@ impl SyncManager {
         debug!("Wrote handoff {} to {:?}", handoff.id, path);
 
         if self.config.auto_commit {
-            self.commit_changes(&format!(
+            self.commit_pending_changes(&format!(
                 "XAS handoff [{}]: {}",
                 handoff.mode.kind(),
                 handoff.summary
@@ -150,8 +150,10 @@ impl SyncManager {
         Ok(handoffs)
     }
 
-    /// Archive a processed handoff
-    pub fn archive_handoff(&self, handoff_id: &str) -> Result<()> {
+    /// Archive a processed handoff and return the archived file path
+    pub fn archive_handoff(&self, handoff_id: &str) -> Result<PathBuf> {
+        let short_id = handoff_id.chars().take(8).collect::<String>();
+
         // Find the handoff file in pending
         for entry in std::fs::read_dir(&self.config.pending)? {
             let entry = entry?;
@@ -159,16 +161,16 @@ impl SyncManager {
 
             if path
                 .file_name()
-                .is_some_and(|n| n.to_string_lossy().contains(handoff_id))
+                .is_some_and(|n| n.to_string_lossy().contains(&short_id))
             {
                 let archive_path = self.config.archive.join(path.file_name().unwrap());
                 std::fs::rename(&path, &archive_path)?;
                 debug!("Archived handoff to {:?}", archive_path);
-                return Ok(());
+                return Ok(archive_path);
             }
         }
 
-        Err(crate::Error::HandoffNotFound(handoff_id.to_string()))
+        Err(crate::Error::HandoffNotFound(short_id))
     }
 
     /// Save work-in-progress handoff state
@@ -222,6 +224,40 @@ impl SyncManager {
         repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)?;
 
         info!("Committed: {}", message);
+        Ok(())
+    }
+
+    /// Commit only handoff files in pending/ to avoid sweeping unrelated repo changes.
+    fn commit_pending_changes(&self, message: &str) -> Result<()> {
+        let Some(repo) = &self.repo else {
+            debug!("No git repository, skipping commit");
+            return Ok(());
+        };
+
+        let sig = repo.signature()?;
+        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+
+        // Build an in-memory index snapshot from HEAD tree so we only overlay pending/* changes.
+        // We intentionally avoid writing the index file to disk so existing staged changes stay untouched.
+        let mut index = repo.index()?;
+        if let Some(ref parent_commit) = parent {
+            let parent_tree = parent_commit.tree()?;
+            index.read_tree(&parent_tree)?;
+        } else {
+            index.clear()?;
+        }
+        index.add_all(
+            ["pending/*.json"].iter(),
+            git2::IndexAddOption::DEFAULT,
+            None,
+        )?;
+
+        let tree_id = index.write_tree_to(repo)?;
+        let tree = repo.find_tree(tree_id)?;
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)?;
+
+        info!("Committed pending handoffs: {}", message);
         Ok(())
     }
 
@@ -290,9 +326,9 @@ impl SyncManager {
     /// Get current git branch
     pub fn current_branch(&self) -> Option<String> {
         self.repo.as_ref().and_then(|repo| {
-            repo.head().ok().and_then(|h| {
-                h.shorthand().map(|s| s.to_string())
-            })
+            repo.head()
+                .ok()
+                .and_then(|h| h.shorthand().map(|s| s.to_string()))
         })
     }
 }

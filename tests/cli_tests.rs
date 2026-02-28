@@ -2,8 +2,8 @@
 //!
 //! These tests run the actual CLI binary and verify behavior.
 
-use std::process::Command;
 use std::path::PathBuf;
+use std::process::Command;
 use tempfile::TempDir;
 
 fn xas_binary() -> PathBuf {
@@ -21,6 +21,19 @@ fn run_xas(dir: &TempDir, args: &[&str]) -> (bool, String, String) {
         .args(args)
         .output()
         .expect("Failed to execute xas");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    (output.status.success(), stdout, stderr)
+}
+
+fn run_git(dir: &TempDir, args: &[&str]) -> (bool, String, String) {
+    let output = Command::new("git")
+        .current_dir(dir.path())
+        .args(args)
+        .output()
+        .expect("Failed to execute git");
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -83,7 +96,10 @@ fn test_cli_plan_workflow() {
     assert!(stdout.contains("Started plan handoff"));
 
     // Add requirement
-    let (success, stdout, _) = run_xas(&dir, &["plan", "require", "Must be fast", "--priority", "must"]);
+    let (success, stdout, _) = run_xas(
+        &dir,
+        &["plan", "require", "Must be fast", "--priority", "must"],
+    );
     assert!(success);
     assert!(stdout.contains("Added requirement"));
 
@@ -93,7 +109,16 @@ fn test_cli_plan_workflow() {
     assert!(stdout.contains("Recorded decision"));
 
     // Add decision with --why
-    let (success, stdout, _) = run_xas(&dir, &["plan", "decided", "Use serde", "--why", "Best serialization"]);
+    let (success, stdout, _) = run_xas(
+        &dir,
+        &[
+            "plan",
+            "decided",
+            "Use serde",
+            "--why",
+            "Best serialization",
+        ],
+    );
     assert!(success);
     assert!(stdout.contains("Recorded decision"));
 
@@ -129,7 +154,10 @@ fn test_cli_debug_workflow() {
     assert!(stdout.contains("Added symptom"));
 
     // Add hypothesis
-    let (success, _, _) = run_xas(&dir, &["debug", "hypothesis", "Memory leak", "--likelihood", "high"]);
+    let (success, _, _) = run_xas(
+        &dir,
+        &["debug", "hypothesis", "Memory leak", "--likelihood", "high"],
+    );
     assert!(success);
 
     // Add tried (without --result, testing default)
@@ -138,7 +166,10 @@ fn test_cli_debug_workflow() {
     assert!(stdout.contains("Recorded attempt"));
 
     // Add suspect
-    let (success, _, _) = run_xas(&dir, &["debug", "suspect", "src/cache.rs", "Unbounded cache"]);
+    let (success, _, _) = run_xas(
+        &dir,
+        &["debug", "suspect", "src/cache.rs", "Unbounded cache"],
+    );
     assert!(success);
 
     // Status should show WIP
@@ -208,4 +239,153 @@ fn test_cli_help() {
     assert!(stdout.contains("deploy"));
     assert!(stdout.contains("debug"));
     assert!(stdout.contains("plan"));
+    assert!(stdout.contains("archive"));
+}
+
+#[test]
+fn test_cli_handoff_json_output() {
+    let dir = TempDir::new().unwrap();
+    run_xas(&dir, &["init"]);
+    run_xas(&dir, &["whoami", "--set", "test-agent"]);
+
+    let (success, stdout, _) = run_xas(
+        &dir,
+        &[
+            "--json",
+            "handoff",
+            "--mode",
+            "plan",
+            "Machine readable event",
+        ],
+    );
+
+    assert!(success);
+    let payload: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(payload["event"], "handoff_created");
+    assert_eq!(payload["mode"], "plan");
+    assert_eq!(payload["summary"], "Machine readable event");
+    assert!(payload["id"].as_str().unwrap().len() > 8);
+    assert_eq!(payload["id_short"].as_str().unwrap().len(), 8);
+}
+
+#[test]
+fn test_cli_no_auto_commit_does_not_advance_head() {
+    let dir = TempDir::new().unwrap();
+    let (ok, _, err) = run_git(&dir, &["init"]);
+    assert!(ok, "{}", err);
+    run_git(&dir, &["config", "user.email", "test@example.com"]);
+    run_git(&dir, &["config", "user.name", "Test Agent"]);
+
+    std::fs::write(dir.path().join("README.md"), "base\n").unwrap();
+    run_git(&dir, &["add", "README.md"]);
+    run_git(&dir, &["commit", "-m", "init"]);
+    let (_, before_head, _) = run_git(&dir, &["rev-parse", "HEAD"]);
+
+    run_xas(&dir, &["init"]);
+    run_xas(&dir, &["whoami", "--set", "test-agent"]);
+
+    std::fs::write(dir.path().join("unrelated.txt"), "keep staged\n").unwrap();
+    run_git(&dir, &["add", "unrelated.txt"]);
+
+    let (success, _, stderr) = run_xas(
+        &dir,
+        &[
+            "--no-auto-commit",
+            "handoff",
+            "--mode",
+            "plan",
+            "No commit expected",
+        ],
+    );
+    assert!(success, "{}", stderr);
+
+    let (_, after_head, _) = run_git(&dir, &["rev-parse", "HEAD"]);
+    assert_eq!(before_head.trim(), after_head.trim());
+}
+
+#[test]
+fn test_cli_auto_commit_is_scoped_to_handoff_paths() {
+    let dir = TempDir::new().unwrap();
+    let (ok, _, err) = run_git(&dir, &["init"]);
+    assert!(ok, "{}", err);
+    run_git(&dir, &["config", "user.email", "test@example.com"]);
+    run_git(&dir, &["config", "user.name", "Test Agent"]);
+
+    std::fs::write(dir.path().join("README.md"), "base\n").unwrap();
+    run_git(&dir, &["add", "README.md"]);
+    run_git(&dir, &["commit", "-m", "init"]);
+    let (_, before_head, _) = run_git(&dir, &["rev-parse", "HEAD"]);
+
+    run_xas(&dir, &["init"]);
+    run_xas(&dir, &["whoami", "--set", "test-agent"]);
+
+    std::fs::write(dir.path().join("unrelated.txt"), "staged but unrelated\n").unwrap();
+    run_git(&dir, &["add", "unrelated.txt"]);
+
+    let (success, _, stderr) = run_xas(
+        &dir,
+        &["handoff", "--mode", "plan", "Scoped auto commit behavior"],
+    );
+    assert!(success, "{}", stderr);
+
+    let (_, after_head, _) = run_git(&dir, &["rev-parse", "HEAD"]);
+    assert_ne!(before_head.trim(), after_head.trim());
+
+    let (_, commit_files, _) = run_git(&dir, &["show", "--name-only", "--pretty=format:", "HEAD"]);
+    assert!(commit_files.contains("pending/"));
+    assert!(!commit_files.contains("unrelated.txt"));
+
+    let (_, status, _) = run_git(&dir, &["status", "--short"]);
+    assert!(status.contains("A  unrelated.txt"));
+}
+
+#[test]
+fn test_cli_archive_specific_handoff_with_json_output() {
+    let dir = TempDir::new().unwrap();
+    run_xas(&dir, &["init"]);
+    run_xas(&dir, &["whoami", "--set", "test-agent"]);
+
+    let (success, stdout, stderr) = run_xas(
+        &dir,
+        &["--json", "handoff", "--mode", "plan", "Archive me"],
+    );
+    assert!(success, "{}", stderr);
+    let first: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let first_id_short = first["id_short"].as_str().unwrap().to_string();
+
+    let (success, _, stderr) = run_xas(
+        &dir,
+        &["--json", "handoff", "--mode", "debug", "Keep me pending"],
+    );
+    assert!(success, "{}", stderr);
+
+    let pending_before = std::fs::read_dir(dir.path().join("pending"))
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .count();
+    let archive_before = std::fs::read_dir(dir.path().join("archive"))
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .count();
+    assert_eq!(pending_before, 2);
+    assert_eq!(archive_before, 0);
+
+    let (success, stdout, stderr) = run_xas(&dir, &["--json", "archive", &first_id_short]);
+    assert!(success, "{}", stderr);
+    let archived: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(archived["event"], "handoff_archived");
+    assert_eq!(archived["id_short"], first_id_short);
+    assert_eq!(archived["summary"], "Archive me");
+    assert!(archived["path"].as_str().unwrap().contains("archive/"));
+
+    let pending_after = std::fs::read_dir(dir.path().join("pending"))
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .count();
+    let archive_after = std::fs::read_dir(dir.path().join("archive"))
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .count();
+    assert_eq!(pending_after, 1);
+    assert_eq!(archive_after, 1);
 }

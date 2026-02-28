@@ -138,9 +138,13 @@ xas receive --prompt
 
 # Filter by mode
 xas receive --mode debug --prompt
+
+# Archive exactly one handoff by ID/prefix
+xas archive 1a2b3c4d
 ```
 
 The compiled prompt is optimized for LLM consumption — structured, prioritized, ready to act on.
+Use `xas receive --archive` only when you intentionally want to archive every displayed handoff.
 
 ---
 
@@ -162,10 +166,35 @@ The compiled prompt is optimized for LLM consumption — structured, prioritized
 ```
 
 1. **Creating agent** builds handoff incrementally with mode-specific commands
-2. `xas done` saves JSON to `pending/` and auto-commits
+2. `xas <mode> done` saves JSON to `pending/` and auto-commits handoff files by default
 3. Git syncs to shared repository
 4. **Receiving agent** runs `xas receive --prompt` to get compiled context
 5. Processed handoffs move to `archive/`
+
+---
+
+## Automation and Commit Control
+
+Use these global flags with any command:
+
+```bash
+# Disable automatic git commits (write files only)
+xas --no-auto-commit plan done
+
+# Emit machine-readable JSON for handoff creation/finalization
+xas --json handoff --mode plan "Design caching layer"
+```
+
+`--json` creation output includes:
+- `id` (full UUID)
+- `id_short` (8-char prefix)
+- `mode`
+- `summary`
+- `path`
+- `auto_commit`
+
+Auto-commit behavior is scoped to handoff paths in `pending/` so unrelated repo
+changes are not swept into xas commits.
 
 ---
 
@@ -175,7 +204,8 @@ The compiled prompt is optimized for LLM consumption — structured, prioritized
 your-project/
 ├── .xas/              # Local state (gitignored)
 │   ├── wip.json       # Work-in-progress handoff
-│   └── agent.json     # Your agent identity
+│   ├── current_agent.json  # Preferred identity file
+│   └── agent.json          # Legacy-compatible identity file
 ├── pending/           # Active handoffs (committed, shared)
 ├── archive/           # Processed handoffs (committed)
 └── ... your code ...
@@ -224,7 +254,7 @@ cargo test
 cargo test -- --nocapture
 ```
 
-22 tests covering handoff creation, serialization, CLI workflows, and all three modes.
+25 tests covering handoff creation, serialization, CLI workflows, automation flags, and all three modes.
 
 ---
 
